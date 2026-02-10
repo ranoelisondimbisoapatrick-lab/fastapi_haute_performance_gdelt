@@ -6,6 +6,7 @@ class Settings(BaseSettings):
 
     app_env: str = "dev"
     app_name: str = "fastapi-gdelt-industrial"
+    local_mode: bool = True
     log_level: str = "INFO"
 
     postgres_host: str = "localhost"
@@ -26,6 +27,9 @@ class Settings(BaseSettings):
     gdelt_max_download_mb: int = 200
 
     duckdb_db_path: str = "/tmp/analytics.duckdb"
+
+    # Local filesystem Data Lake (Parquet)
+    data_lake_path: str = "./data_lake"
 
     @property
     def postgres_dsn(self) -> str:

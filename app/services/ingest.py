@@ -1,83 +1,94 @@
-import io
-import csv
-import zipfile
+from __future__ import annotations
+
+import asyncio
+import tempfile
 from datetime import datetime
-from typing import AsyncIterator
+from pathlib import Path
+from typing import Optional
 
 import httpx
-import pandas as pd
 import pyarrow as pa
+import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
 from app.core.config import settings
-from app.infra.s3 import s3_client, ensure_bucket
+from app.infra.fs_lake import ensure_lake_dirs, parquet_path
+from app.domain.gdelt_events_schema import EVENTS_COLUMNS
 from .gdelt import GdeltFile
 
 
-async def _download_zip(url: str) -> bytes:
-    # Safety: hard limit to avoid accidental huge downloads in local POC.
+async def _download_to_file(url: str, dest: Path) -> None:
+    """Stream-download a URL into a local file (memory-efficient)."""
     max_bytes = settings.gdelt_max_download_mb * 1024 * 1024
+    downloaded = 0
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("GET", url) as r:
             r.raise_for_status()
-            buf = bytearray()
-            async for chunk in r.aiter_bytes():
-                buf.extend(chunk)
-                if len(buf) > max_bytes:
-                    raise RuntimeError(f"Download exceeds limit ({settings.gdelt_max_download_mb} MB).")
-            return bytes(buf)
+            with dest.open("wb") as f:
+                async for chunk in r.aiter_bytes():
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise RuntimeError(f"Download exceeds limit ({settings.gdelt_max_download_mb} MB).")
+                    f.write(chunk)
 
 
-def _csv_from_zip(zip_bytes: bytes) -> io.TextIOBase:
-    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    # GDELT zip contains one CSV
-    name = zf.namelist()[0]
-    raw = zf.read(name)
-    return io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8", errors="replace")
+def _extract_single_member(zip_path: Path, out_dir: Path) -> Path:
+    """Extract the first (and usually only) member of a zip to out_dir."""
+    import zipfile
+
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+        if not names:
+            raise RuntimeError("Empty zip")
+        name = names[0]
+        out = out_dir / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(name, "r") as src, out.open("wb") as dst:
+            # stream copy
+            while True:
+                buf = src.read(1024 * 1024)
+                if not buf:
+                    break
+                dst.write(buf)
+        return out
 
 
-def _events_to_parquet(csv_file: io.TextIOBase, out_path: str) -> None:
-    # GDELT Events CSV is tab-delimited in many exports; handle both.
-    sample = csv_file.read(4096)
-    csv_file.seek(0)
-    delimiter = "\t" if "\t" in sample else ","
+def _write_events_parquet(csv_path: Path, out_parquet: Path) -> None:
+    """Read a (tab-delimited) CSV export and write to Parquet (ZSTD)."""
+    # GDELT exports are usually TAB-delimited, no header.
+    parse_opts = pacsv.ParseOptions(delimiter="\t", newlines_in_values=False)
+    read_opts = pacsv.ReadOptions(autogenerate_column_names=True)
+    convert_opts = pacsv.ConvertOptions(strings_can_be_null=True)
 
-    reader = csv.reader(csv_file, delimiter=delimiter)
-    rows = list(reader)
+    table = pacsv.read_csv(str(csv_path), read_options=read_opts, parse_options=parse_opts, convert_options=convert_opts)
 
-    if not rows:
-        raise RuntimeError("Empty CSV")
+    # If width matches known schema, rename columns to meaningful names
+    if table.num_columns == len(EVENTS_COLUMNS):
+        table = table.rename_columns(EVENTS_COLUMNS)
+    else:
+        # Keep generic f0..fN column names, but make them stable like c1..cN
+        cols = [f"c{i+1}" for i in range(table.num_columns)]
+        table = table.rename_columns(cols)
 
-    # GDELT exports may not include header; store as generic columns c1..cN
-    width = max(len(r) for r in rows)
-    cols = [f"c{i+1}" for i in range(width)]
-    norm = [r + [""] * (width - len(r)) for r in rows]
-
-    df = pd.DataFrame(norm, columns=cols)
-
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    pq.write_table(table, out_path, compression="zstd")
+    pq.write_table(table, str(out_parquet), compression="zstd")
 
 
 async def ingest_one(gf: GdeltFile) -> dict:
-    """Download one batch and write to S3 as Parquet, partitioned by date."""
-    ensure_bucket()
-    s3 = s3_client()
+    """Download one batch and write to LOCAL filesystem as Parquet, partitioned by date."""
+    ensure_lake_dirs()
 
-    zip_bytes = await _download_zip(gf.url)
-    csv_fp = _csv_from_zip(zip_bytes)
-
-    # Partition: dt=YYYY-MM-DD from gf.ts
     dt = "unknown"
     if gf.ts != "unknown":
         dt = datetime.strptime(gf.ts, "%Y%m%d%H%M%S").date().isoformat()
 
-    local_tmp = f"/tmp/gdelt_{gf.ts}.parquet"
-    _events_to_parquet(csv_fp, local_tmp)
+    out = parquet_path(dt=dt, ts=gf.ts)
 
-    key = f"events/dt={dt}/batch_ts={gf.ts}.parquet"
-    with open(local_tmp, "rb") as f:
-        s3.upload_fileobj(f, settings.s3_bucket, key)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        zip_file = tmpdir / f"gdelt_{gf.ts}.zip"
+        await _download_to_file(gf.url, zip_file)
+        csv_file = _extract_single_member(zip_file, tmpdir)
+        _write_events_parquet(csv_file, out)
 
-    return {"s3_key": key, "dt": dt, "ts": gf.ts, "url": gf.url}
+    return {"path": str(out), "dt": dt, "ts": gf.ts, "url": gf.url}

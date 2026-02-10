@@ -11,19 +11,17 @@ services:
       - POSTGRES_PASSWORD=app
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - S3_ENDPOINT=http://minio:9000
-      - S3_ACCESS_KEY=minioadmin
-      - S3_SECRET_KEY=minioadmin
-      - S3_BUCKET=gdelt-lake
       - GDELT_LASTUPDATE_URL=https://data.gdeltproject.org/gdeltv2/lastupdate.txt
       - GDELT_MAX_DOWNLOAD_MB=200
       - DUCKDB_DB_PATH=/tmp/analytics.duckdb
+      - DATA_LAKE_PATH=/data_lake
     ports:
       - "8000:8000"
+    volumes:
+      - data_lake:/data_lake
     depends_on:
       - postgres
       - redis
-      - minio
 
   worker:
     build: .
@@ -38,17 +36,15 @@ services:
       - POSTGRES_PASSWORD=app
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - S3_ENDPOINT=http://minio:9000
-      - S3_ACCESS_KEY=minioadmin
-      - S3_SECRET_KEY=minioadmin
-      - S3_BUCKET=gdelt-lake
       - GDELT_LASTUPDATE_URL=https://data.gdeltproject.org/gdeltv2/lastupdate.txt
       - GDELT_MAX_DOWNLOAD_MB=200
       - DUCKDB_DB_PATH=/tmp/analytics.duckdb
+      - DATA_LAKE_PATH=/data_lake
+    volumes:
+      - data_lake:/data_lake
     depends_on:
       - postgres
       - redis
-      - minio
 
   postgres:
     image: postgres:16
@@ -66,18 +62,6 @@ services:
     ports:
       - "6379:6379"
 
-  minio:
-    image: minio/minio:RELEASE.2024-12-18T01-15-03Z
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - miniodata:/data
-
 volumes:
   pgdata:
-  miniodata:
+  data_lake:
