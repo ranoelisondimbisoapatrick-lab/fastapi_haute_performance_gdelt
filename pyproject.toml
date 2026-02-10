@@ -2,7 +2,7 @@
 name = "fastapi-gdelt-industrial"
 version = "0.1.0"
 description = "FastAPI haute performance POC -> industriel avec ingestion GDELT big data"
-authors = ["You <you@example.com>"]
+authors = ["RANOELISON Dimbisoa Patrick <patdimby@outlook.fr>"]
 readme = "README.md"
 packages = [{include = "app"}]
 
