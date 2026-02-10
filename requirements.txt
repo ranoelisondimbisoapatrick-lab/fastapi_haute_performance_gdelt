@@ -61,6 +61,7 @@ platformdirs==4.5.1
 pluggy==1.6.0
 poetry==2.3.2
 poetry-core==2.3.1
+prometheus_client==0.24.1
 psutil==7.2.2
 pyarrow==23.0.0
 pycparser==3.0

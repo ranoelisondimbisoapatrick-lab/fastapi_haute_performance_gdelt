@@ -1,8 +1,15 @@
-"""GDELT 2.x Events export schema (tab-delimited).
+"""app.domain.gdelt_events_schema
 
-This list is commonly used for the `*.export.CSV.zip` files.
-If a batch contains a different width, ingestion will gracefully fall back to generic columns.
+GDELT 2.x Events export schema.
+
+GDELT Events `*.export.CSV.zip` is typically tab-delimited and has no header.
+If an ingested file matches this column count, we rename the Parquet columns
+to these meaningful names. Otherwise we fall back to generic columns c1..cN.
+
+This strategy keeps ingestion robust even if a batch differs unexpectedly.
 """
+
+from __future__ import annotations
 
 EVENTS_COLUMNS: list[str] = [
     "GlobalEventID",

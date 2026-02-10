@@ -1,19 +1,30 @@
 from __future__ import annotations
 
-import asyncio
+"""app.services.ingest
+
+Ingestion pipeline for a single GDELT batch:
+- stream download zip to a temp file (memory efficient)
+- extract CSV file (stream copy)
+- convert CSV -> Parquet using PyArrow
+- write Parquet to filesystem Data Lake (partitioned)
+
+Good practices:
+- Safety cap on download size (gdelt_max_download_mb)
+- Avoid loading entire zip in memory
+- Use compression (ZSTD) to reduce disk footprint
+"""
+
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import httpx
-import pyarrow as pa
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
 from app.core.config import settings
-from app.infra.fs_lake import ensure_lake_dirs, parquet_path
 from app.domain.gdelt_events_schema import EVENTS_COLUMNS
+from app.infra.fs_lake import ensure_lake_dirs, parquet_path
 from .gdelt import GdeltFile
 
 
@@ -44,8 +55,9 @@ def _extract_single_member(zip_path: Path, out_dir: Path) -> Path:
         name = names[0]
         out = out_dir / name
         out.parent.mkdir(parents=True, exist_ok=True)
+
+        # Stream copy to avoid memory blowups
         with zf.open(name, "r") as src, out.open("wb") as dst:
-            # stream copy
             while True:
                 buf = src.read(1024 * 1024)
                 if not buf:
@@ -55,19 +67,23 @@ def _extract_single_member(zip_path: Path, out_dir: Path) -> Path:
 
 
 def _write_events_parquet(csv_path: Path, out_parquet: Path) -> None:
-    """Read a (tab-delimited) CSV export and write to Parquet (ZSTD)."""
-    # GDELT exports are usually TAB-delimited, no header.
+    """Read a TAB-delimited CSV export and write it to Parquet (ZSTD)."""
     parse_opts = pacsv.ParseOptions(delimiter="\t", newlines_in_values=False)
     read_opts = pacsv.ReadOptions(autogenerate_column_names=True)
     convert_opts = pacsv.ConvertOptions(strings_can_be_null=True)
 
-    table = pacsv.read_csv(str(csv_path), read_options=read_opts, parse_options=parse_opts, convert_options=convert_opts)
+    table = pacsv.read_csv(
+        str(csv_path),
+        read_options=read_opts,
+        parse_options=parse_opts,
+        convert_options=convert_opts,
+    )
 
-    # If width matches known schema, rename columns to meaningful names
+    # If the width matches known schema, rename columns to meaningful names.
     if table.num_columns == len(EVENTS_COLUMNS):
         table = table.rename_columns(EVENTS_COLUMNS)
     else:
-        # Keep generic f0..fN column names, but make them stable like c1..cN
+        # Stable generic naming
         cols = [f"c{i+1}" for i in range(table.num_columns)]
         table = table.rename_columns(cols)
 
@@ -75,7 +91,18 @@ def _write_events_parquet(csv_path: Path, out_parquet: Path) -> None:
 
 
 async def ingest_one(gf: GdeltFile) -> dict:
-    """Download one batch and write to LOCAL filesystem as Parquet, partitioned by date."""
+    """Download one batch and write to LOCAL filesystem as Parquet.
+
+    Args:
+        gf: The GDELT batch file to ingest.
+
+    Returns:
+        Dict containing:
+        - path: local parquet path
+        - dt: partition date (YYYY-MM-DD)
+        - ts: batch timestamp (YYYYMMDDHHMMSS)
+        - url: source url
+    """
     ensure_lake_dirs()
 
     dt = "unknown"

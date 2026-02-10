@@ -1,8 +1,24 @@
 from __future__ import annotations
 
+"""app.services.duckdb_queries
+
+DuckDB query helpers used by the API layer.
+
+Key points:
+- Reads Parquet from filesystem Data Lake (partitioned by dt=YYYY-MM-DD).
+- Normalizes Windows paths into POSIX-style paths for DuckDB.
+- Provides:
+  * full-text search (LIKE over concatenated columns)
+  * top-values aggregations (GROUP BY)
+  * tone statistics (AvgTone) when available
+
+Good practices:
+- Keep SQL inside triple-quoted strings.
+- Parametrize values (avoid string concatenation for user inputs).
+"""
+
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import duckdb
 
@@ -12,39 +28,58 @@ from app.infra.fs_lake import lake_root, ensure_lake_dirs
 
 @dataclass(frozen=True)
 class ColumnSet:
+    """Represents detected Parquet columns."""
+
     has_named_schema: bool
     cols: set[str]
 
     def pick(self, preferred: Sequence[str], fallback: str) -> str:
+        """Pick the first column present in preferred list, else fallback."""
         for c in preferred:
             if c in self.cols:
                 return c
         return fallback
 
 
+def connect() -> duckdb.DuckDBPyConnection:
+    """Create a DuckDB connection (file-based)."""
+    return duckdb.connect(settings.duckdb_db_path)
+
+
+def _normalize_path_for_duckdb(path: str) -> str:
+    """DuckDB path handling prefers forward slashes on Windows."""
+    return path.replace("\\", "/")
+
+
 def _parquet_glob_for_dates(since: str | None, until: str | None) -> str:
-    """Return a parquet glob path with basic partition pruning.
+    """Return a parquet glob path with best-effort partition pruning.
 
     Layout: data_lake/events/dt=YYYY-MM-DD/*.parquet
-    - If since==until -> exact partition
-    - Else -> broad glob (POC). (vNext: catalog + range pruning)
+
+    Strategy (POC):
+    - if since==until: scan exactly that partition
+    - if since only: scan that partition
+    - else: scan all partitions
+
+    Production version would implement a catalog + true pruning for ranges.
     """
     root = lake_root()
     base = root / "events"
 
     if since and until and since == until:
-        return str(base / f"dt={since}" / "*.parquet")
+        return _normalize_path_for_duckdb(str(base / f"dt={since}" / "*.parquet"))
     if since and not until:
-        # single date partition best-effort (avoid downloading too much)
-        return str(base / f"dt={since}" / "*.parquet")
-    # broad scan (POC)
-    return str(base / "dt=*" / "*.parquet")
+        return _normalize_path_for_duckdb(str(base / f"dt={since}" / "*.parquet"))
+
+    return _normalize_path_for_duckdb(str(base / "dt=*" / "*.parquet"))
 
 
 def _detect_columns(con: duckdb.DuckDBPyConnection, parquet_glob: str) -> ColumnSet:
-    # Use DESCRIBE on read_parquet to get columns without scanning full data
+    """Detect columns with DESCRIBE without scanning the whole dataset."""
     try:
-        df = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{parquet_glob}') LIMIT 1").fetch_df()
+        df = con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{parquet_glob}') LIMIT 1"
+        ).fetch_df()
         cols = set(df["column_name"].tolist())
         has_named = "GlobalEventID" in cols and "EventCode" in cols
         return ColumnSet(has_named_schema=has_named, cols=cols)
@@ -52,25 +87,36 @@ def _detect_columns(con: duckdb.DuckDBPyConnection, parquet_glob: str) -> Column
         return ColumnSet(has_named_schema=False, cols=set())
 
 
-def connect() -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(settings.duckdb_db_path)
-
-
 def search_fulltext(query: str, since: str | None, until: str | None, limit: int) -> tuple[int, list[dict]]:
+    """Full-text LIKE search over all columns.
+
+    Implementation detail:
+    - DuckDB `concat_ws(' ', *)` concatenates all columns into one string.
+    - We then apply a case-insensitive LIKE.
+
+    Args:
+        query: search term (user input)
+        since/until: best-effort partition selection
+        limit: maximum number of rows
+
+    Returns:
+        (count, rows) where rows is a list of dicts.
+    """
     ensure_lake_dirs()
     parquet_glob = _parquet_glob_for_dates(since, until)
     con = connect()
 
     sql = f"""
     WITH t AS (SELECT * FROM read_parquet('{parquet_glob}'))
-    SELECT *, (concat_ws(' ', *)) AS _all
+    SELECT *, concat_ws(' ', *) AS _all
     FROM t
-    WHERE lower((concat_ws(' ', *))) LIKE '%' || lower(?) || '%'
+    WHERE lower(concat_ws(' ', *)) LIKE '%' || lower(?) || '%'
     LIMIT ?
     """
+
     df = con.execute(sql, [query, limit]).fetch_df()
     count = len(df)
-    rows = df.drop(columns=[c for c in df.columns if c == "_all"], errors="ignore").to_dict(orient="records")
+    rows = df.drop(columns=["_all"], errors="ignore").to_dict(orient="records")
     return count, rows
 
 
@@ -81,10 +127,18 @@ def top_values(
     until: str | None,
     limit: int,
 ) -> list[dict]:
-    """Generic group-by count over a field (named schema preferred).""
+    """Generic GROUP BY COUNT over a selected field.
+
+    - If named schema exists, we prefer semantic columns like EventCode.
+    - Otherwise we fall back to a generic column name like c27.
+
+    Returns:
+        List[{"key": <value>, "n": <count>}, ...]
+    """
     ensure_lake_dirs()
     parquet_glob = _parquet_glob_for_dates(since, until)
     con = connect()
+
     cols = _detect_columns(con, parquet_glob)
     field = cols.pick(field_candidates, fallback)
 
@@ -97,21 +151,26 @@ def top_values(
     ORDER BY n DESC
     LIMIT ?
     """
+
     df = con.execute(sql, [limit]).fetch_df()
     return df.to_dict(orient="records")
 
 
 def tone_stats(since: str | None, until: str | None) -> dict:
-    """Compute tone statistics if AvgTone exists; else returns empty.""
+    """Compute tone statistics from AvgTone when available."""
     ensure_lake_dirs()
     parquet_glob = _parquet_glob_for_dates(since, until)
     con = connect()
+
     cols = _detect_columns(con, parquet_glob)
     if "AvgTone" not in cols.cols:
         return {"available": False}
 
     sql = f"""
-    WITH t AS (SELECT try_cast(AvgTone AS DOUBLE) AS tone FROM read_parquet('{parquet_glob}'))
+    WITH t AS (
+      SELECT try_cast(AvgTone AS DOUBLE) AS tone
+      FROM read_parquet('{parquet_glob}')
+    )
     SELECT
       COUNT(*) AS n,
       AVG(tone) AS avg_tone,
@@ -120,6 +179,7 @@ def tone_stats(since: str | None, until: str | None) -> dict:
     FROM t
     WHERE tone IS NOT NULL
     """
+
     row = con.execute(sql).fetchone()
     return {
         "available": True,

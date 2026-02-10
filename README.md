@@ -116,3 +116,9 @@ Sinon, fallback automatique vers `c1..cN`.
 - `GET /api/v1/analytics/tone?since=YYYY-MM-DD`
 
 > Astuce: commence par ingérer au moins 1 batch, puis teste ces endpoints.
+
+
+## OpenAPI / Swagger
+- Swagger UI: `GET /docs`
+- OpenAPI JSON: `GET /openapi.json`
+- ReDoc: `GET /redoc`
